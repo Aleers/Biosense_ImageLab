@@ -75,17 +75,17 @@ Os valores são ângulos internos 2D entre 0° e 180°. O detector do vídeo apl
 
 ## Revisão e calibração
 
-Depois da detecção, o aplicativo abre a tela de revisão. Arraste a barra para navegar no vídeo ou use **Reproduzir/Pausar**. Para corrigir, clique em um ponto verde e depois na posição correta. Nos 180 quadros seguintes, um rastreador CSRT segue a aparência da bolinha e uma máscara branca refina o seu centro. Quando ambos perdem a referência, o programa utiliza a estimativa automática com influência decrescente da correção.
+Depois da deteccao, revise e calibre o video. As correcoes sao rastreadas ate o fim; perdas sao sinalizadas e nao entram nas medidas. A interface aplica o resultado completo somente apos sucesso.
 
 ## Fases e parâmetros da marcha
 
-No modo lateral, o pé fica verde durante **APOIO** e laranja durante **BALANÇO**. As transições são marcadas como **CONTATO INICIAL** e **RETIRADA DO PÉ**. A classificação é uma heurística baseada na proximidade estimada do solo e na velocidade do pé; os 60%/40% são referências esperadas, não valores impostos pelo programa.
+No modo lateral, verde indica apoio associado a uma pisada registrada; amarelo indica apoio sem novo contato confirmado e laranja indica balanco. A classificacao continua sendo uma heuristica 2D, com confirmacao temporal.
 
 Com calibração, cada contato inicial atualiza o comprimento do passo (distância entre tornozelos) e da passada (deslocamento entre contatos consecutivos do mesmo calcanhar). A câmera deve estar fixa, perpendicular e a referência de calibração deve estar no plano da marcha.
 
 O vídeo também exibe uma tabela ampliada dos ângulos com valor atual, mínimo e máximo. À direita, um painel no mesmo padrão mostra as fases coloridas e listas acumuladas de `Pisada 01`, `Pisada 02`... e `Passada 01`, `Passada 02`..., com lado e distância. O espaçamento se adapta à quantidade detectada.
 
-Eventos separados por menos de 0,35 s na mesma perna e distâncias inferiores a 5 cm são ignorados. Cada pisada aceita deixa uma marca numerada na posição do calcanhar no vídeo.
+Contatos sao confirmados por persistencia temporal e alternancia. A contagem independe da calibracao e de distancia minima de 5 cm. O apoio ja presente ao iniciar o video nao e contado como contato novo. Candidatos rejeitados ficam registrados na sessao.
 
 Na vista frontal, a tabela esquerda inclui os ângulos Q estimados de ambos os lados. O painel direito **STEP DOWN 2D** apresenta valor atual, mínimo e máximo de FPPA, inclinação da pelve, inclinação do tronco e deslocamento horizontal joelho–pé. Sem calibração, o deslocamento é mostrado em pixels; com calibração, em centímetros. São medidas cinemáticas 2D auxiliares, não uma classificação clínica automática.
 
@@ -110,11 +110,11 @@ O botão **Desfazer** mantém o histórico da tela de revisão. Ele remove, em o
 - o rastro lateral usa uma camada cumulativa e acrescenta somente o novo trecho;
 - a revisão calcula os centros das orelhas uma vez e usa uma única chamada de polilinha para o trajeto.
 
-Na análise lateral, o rastro da orelha e o rastreamento iniciado por uma correção manual continuam até o fim do vídeo. Pisadas aceitas precisam alternar os lados, respeitar intervalo mínimo e estar separadas ao menos 5 cm da posição anterior.
+O rastro da orelha e as correcoes acompanhadas continuam ate o fim do video. Os criterios de pisada ficam em GaitOptions: confirmacao de 0.06 s (minimo dois quadros), intervalo de 0.30 s na mesma perna e 0.10 s entre lados alternados.
 
 Para calibrar, selecione **Calibrar**, clique nas duas extremidades de um objeto visível com tamanho conhecido e informe a distância em centímetros. A escala é usada nas medidas lineares do CSV. Os ângulos não dependem dessa escala.
 
-No modo lateral, o vídeo mostra o centro das orelhas e o rastro dos últimos 180 quadros. Com calibração, o CSV inclui distância direta e horizontal entre tornozelos, deslocamento da orelha desde o início e caminho acumulado da orelha.
+No modo lateral, o rastro acumulado das orelhas permanece visivel. Com calibracao, o CSV inclui distancias entre tornozelos, deslocamento da orelha e caminho acumulado.
 
 ## Ângulo Q estimado
 
@@ -135,3 +135,105 @@ Aviso exibido pela aplicacao: prototipo de analise cinematica 2D. Nao e disposit
 - gráficos de ângulo por ciclo normalizado de 0% a 100%;
 - comparação entre lados e relatório;
 - validação contra marcações feitas por fisioterapeutas e sistema de referência.
+
+
+## Qualidade dos dados, rastreamento e sessoes
+
+`LandmarkValidator` centraliza validacao de coordenadas finitas, visibilidade,
+indices e calibracao. Os mesmos criterios sao aplicados a angulos, medidas
+entre landmarks, metricas frontais e eventos da marcha. Pontos indisponiveis
+nao geram medidas; lacunas nao geram eventos de contato/retirada.
+As formulas angulares e as colunas legadas do CSV foram preservadas.
+
+O rastreamento de correcoes fica em `tracking.py`. CSRT e candidatos brancos
+sao verificados por aparencia, continuidade e ambiguidade. Os estados registrados
+sao `manual`, `tracking`, `suspect`, `lost` e `reacquired`. A reaquisi??o exige
+confirmacao em quadros consecutivos. Em perda/ambiguidade, as coordenadas automaticas
+ficam preservadas, mas o ponto corrigido recebe visibilidade zero e nao entra nas
+medidas ate ser confirmado novamente. O valor tecnico 0.8 de aceita??o do rastreador
+nao representa uma probabilidade calibrada de acerto. A visibilidade original do
+MediaPipe permanece na camada original da sessao.
+
+A thread de rastreamento produz um lote isolado. A interface aplica o lote inteiro
+somente apos sucesso. Falhas de leitura nao aplicam correcoes parciais. Fechar a
+revisao cancela o trabalho pendente. A publicacao de MP4/CSV usa arquivos temporarios
+e restaura arquivos anteriores se uma substituicao falhar; nao e uma transacao
+resistente a queda de energia entre arquivos.
+
+Uma sessao `<nome>_<id>.session.zip` e salva ao terminar a deteccao, apos alteracoes
+da revisao e ao exportar. Para reabrir, use **Selecionar** na entrada e escolha o
+filtro **Sessoes**. O video original precisa continuar no caminho registrado.
+Se ele foi movido, a API `SessionStore.load(path, input_path=novo_caminho)` permite
+informar sua nova localizacao; o conteudo e verificado por SHA-256.
+
+O arquivo de sessao inclui:
+
+- `landmarks.npz`: landmarks originais antes da estabilizacao/correcoes e atuais,
+  com mascara explicita de quadros sem pessoa; sem pickle;
+- `manifest.json`: identificador, configuracoes, calibracao, medidas, historico
+  de desfazer, eventos de auditoria, estados e fontes do rastreamento;
+- hashes do video e do codigo, versoes das dependencias e timestamps nominais;
+- metricas exportadas em precisao completa, antes do arredondamento do CSV.
+
+O CSV continua com no maximo uma casa decimal, inclusive `time_s`. A sessao preserva
+a precisao completa. Os timestamps atuais usam `frame / fps`, nao timestamps reais
+do container; videos com taxa variavel exigem validacao especifica. O campo legado
+`*_knee_foot_offset_cm` ainda contem pixels quando nao ha calibracao; a unidade real
+fica registrada no manifesto. A convencao de inclinacao pelvica foi preservada.
+Os dados "originais" sao a saida do MediaPipe com sua suavizacao interna ativada.
+
+Filtros adicionais e fluxo optico sao opcionais e desativados por padrao:
+
+```python
+from processor import ProcessingOptions
+options = ProcessingOptions(
+    smoothing_seconds=0.04,
+    tracking_use_optical_flow=True,
+    tracking_smoothing_seconds=0.0,
+)
+```
+
+A suavizacao temporal usa uma constante em segundos e reinicia apos lacunas ou
+pontos de baixa qualidade. O fluxo optico verifica o erro de ida/volta e a aparencia
+do alvo antes de aceitar uma posicao. Testes sinteticos mostram reducao de ruido
+estacionario e recuperacao de um alvo com brilho abaixo do limiar branco, mas nao
+comprovam melhora em videos reais. Parametros de movimento/aparencia sao heuristicos.
+A ausencia de CSRT e registrada; a busca de marcadores continua disponivel.
+
+Para executar os testes sem pytest:
+
+```powershell
+python -B -m unittest -v test_joint_angles test_robustness test_gait_display
+```
+
+A sessao possui dados identificaveis e caminhos locais; armazene-a com os mesmos
+controles usados para os videos do estudo. O historico tecnico nao e uma trilha de
+auditoria assinada, autenticada por usuario ou protegida contra alteracao deliberada.
+
+
+## Registro de pisadas e continuidade visual
+
+`GaitPhaseAnalyzer` confirma fases em uma janela expressa em segundos e aceita
+calcanhar ou ponta do pe visivel. `FootfallRegistry` separa contato de medida:
+um contato alternado confirmado recebe numero mesmo sem calibracao ou sem os
+dois tornozelos visiveis. A distancia pode ser obtida nos proximos 0.20 s de apoio;
+`measurement_frame` registra o quadro usado. Valores abaixo de 5 cm nao removem
+contatos. Uma repeticao do mesmo lado e sinalizada como `nonalternating_contact`,
+sem bloquear o proximo contato valido do lado oposto. Apoio inicial ou retorno
+apos uma lacuna longa nao sao convertidos automaticamente em contato novo.
+
+A sessao guarda `gait_records` com decisoes e distancias, e `display_records`
+com a qualidade da apresentacao. `software_identity` preserva a identificacao
+da deteccao original; `processing_identity` registra o codigo atual no salvamento.
+
+`VisualContinuity` atua somente na imagem, na revisao e na exportacao. A falta
+breve de visibilidade mantem o ultimo angulo por ate 0.20 s, indicado por `~`.
+Depois desse prazo, o rotulo permanece com `--`; o esqueleto anterior fica como
+referencia tracejada cinza. Referencias retidas nao representam a posicao atual
+observada e nao entram no CSV, nas distancias ou na deteccao de pisadas.
+Valores retidos tambem nao atualizam minimos e maximos. Os textos sao limitados
+as bordas do quadro e desenhados apos os paineis para evitar ocultacao.
+
+A exportacao de verificacao do video real fica em `validation_outputs/`.
+A contagem gerada e algoritmica: revisar o video e comparar com anotacoes de
+referencia continua necessario para estimar sensibilidade e falsos positivos.

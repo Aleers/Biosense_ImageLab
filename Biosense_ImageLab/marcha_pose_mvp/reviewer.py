@@ -1,9 +1,15 @@
 import tkinter as tk
 import threading
+import queue
+from dataclasses import replace
 from tkinter import messagebox, simpledialog, ttk
 import cv2, numpy as np
 from PIL import Image, ImageTk
 from i18n import tr
+from tracking import LandmarkTracker, TrackingOptions
+from session import SessionStore
+from visual_continuity import VisualContinuity
+from landmark_quality import LandmarkValidator
 from processor import ProcessingOptions, draw_manual_segments, draw_overlay, ear_center
 COLORS = [('#24d6ff', (255, 214, 36)), ('#ff9f2f', (47, 159, 255)), ('#ff42c8', (200, 66, 255)), ('#35d66f', (111, 214, 53)), ('#4287ff', (255, 135, 66)), ('#ffe342', (66, 227, 255)), ('#ff4545', (69, 69, 255)), ('#a855f7', (247, 85, 168)), ('#ffffff', (255, 255, 255))]
 
@@ -34,7 +40,7 @@ class ReviewWindow(tk.Toplevel):
         super().__init__(parent)
         self.data, self.opts, self.on_export = (data, opts, on_export)
         if opts.side == 'Automatico':
-            self.opts = ProcessingOptions(opts.view, 'Esquerdo' if data.predominant_side == 'left' else 'Direito', opts.visibility_threshold, opts.language)
+            self.opts = replace(opts, side='Esquerdo' if data.predominant_side == 'left' else 'Direito')
         self.lang = self.opts.language
         self.title(tr(self.lang, 'review'))
         self.geometry('1280x820')
@@ -48,17 +54,20 @@ class ReviewWindow(tk.Toplevel):
         self.mode = tk.StringVar(value='Editar')
         self.internal_slide = False
         self.tracking = False
-        self.undo_stack = []
+        self.closed = threading.Event()
+        self.tracking_events = queue.Queue()
+        self.undo_stack = data.review_history
         self.cap = cv2.VideoCapture(str(data.input_path))
         self.cap_next = 0
         self.cache = {}
         self.pending_show = None
         self.ear_centers = [ear_center(p) for p in data.landmarks] if self.opts.view == 'Lateral' else None
+        self.visual_frames = VisualContinuity(self.opts).build(data.landmarks, data.fps)
         self.protocol('WM_DELETE_WINDOW', self.close)
         bar = ttk.Frame(self, padding=8)
         bar.pack(fill='x')
         ttk.Button(bar, text=tr(self.lang, 'play'), command=self.toggle).pack(side='left')
-        self.undo_button = ttk.Button(bar, text=tr(self.lang, 'undo'), command=self.undo, state='disabled')
+        self.undo_button = ttk.Button(bar, text=tr(self.lang, 'undo'), command=self.undo, state='normal' if self.undo_stack else 'disabled')
         self.undo_button.pack(side='left', padx=8)
         ttk.Radiobutton(bar, text=tr(self.lang, 'edit'), variable=self.mode, value='Editar').pack(side='left', padx=12)
         ttk.Radiobutton(bar, text=tr(self.lang, 'calibrate'), variable=self.mode, value='Calibrar').pack(side='left')
@@ -76,6 +85,7 @@ class ReviewWindow(tk.Toplevel):
         self.slider = ttk.Scale(self, from_=0, to=len(data.landmarks) - 1, command=self.slide)
         self.slider.pack(fill='x', padx=12, pady=(0, 10))
         self.after(100, self.show)
+        self.after(100, self.poll_tracking)
 
     def slide(self, v):
         if self.internal_slide:
@@ -85,8 +95,24 @@ class ReviewWindow(tk.Toplevel):
             self.after_cancel(self.pending_show)
         self.pending_show = self.after(35, self.show)
 
+    def persist(self):
+        if self.data.session_path:
+            try:
+                SessionStore().save(self.data, options=self.opts)
+            except Exception as exc:
+                messagebox.showerror('Erro ao salvar sessao', str(exc), parent=self)
+                return False
+        return True
+
     def push_action(self, action):
+        action['audit_id'] = self.data.record('review_action', kind=action['type'], frame=self.index,
+                                            calibration_points=self.data.calibration_points,
+                                            calibration_cm=self.data.calibration_cm,
+                                            manual_segments=self.data.manual_segments,
+                                            tracked_segments=self.data.tracked_segments,
+                                            landmark=action.get('landmark'), before=action.get('snapshot'), before_action=action)
         self.undo_stack.append(action)
+        self.persist()
         self.undo_button.config(state='normal')
 
     def undo(self):
@@ -102,14 +128,18 @@ class ReviewWindow(tk.Toplevel):
             self.data.calibration_points = action['points']
             self.data.calibration_cm = action['cm']
         elif kind == 'point':
+            self.data.tracking_records = action.get('previous_records', self.data.tracking_records)
             for index, value in action['snapshot']:
                 if self.data.landmarks[index] is not None:
                     self.data.landmarks[index][action['landmark']] = value
+        self.data.record('undo', action_id=action.get('audit_id'), kind=kind)
+        self.persist()
         enabled = 'normal' if self.data.px_per_cm else 'disabled'
         self.measure_button.config(state=enabled)
         self.landmark_measure_button.config(state=enabled)
         if not self.undo_stack:
             self.undo_button.config(state='disabled')
+        self.visual_frames = VisualContinuity(self.opts).build(self.data.landmarks, self.data.fps)
         if self.opts.view == 'Lateral':
             self.ear_centers = [ear_center(p) for p in self.data.landmarks]
         self.show()
@@ -132,9 +162,9 @@ class ReviewWindow(tk.Toplevel):
         self.pending_show = None
         frame = self.get_frame(self.index)
         trail = self.ear_centers[:self.index + 1] if self.ear_centers is not None else None
-        frame, _ = draw_overlay(frame, self.data.landmarks[self.index], self.opts, self.data.calibration_points, True, trail)
+        frame, _ = draw_overlay(frame, self.data.landmarks[self.index], self.opts, self.data.calibration_points, True, trail, display=self.visual_frames[self.index])
         current_points = self.data.landmarks[self.index]
-        draw_manual_segments(frame, self.data, self.lang, current_points)
+        draw_manual_segments(frame, self.data, self.lang, current_points, self.opts.visibility_threshold)
         cw, ch = (max(100, self.canvas.winfo_width()), max(100, self.canvas.winfo_height()))
         self.scale = min(cw / self.data.width, ch / self.data.height)
         self.ox = (cw - self.data.width * self.scale) / 2
@@ -144,9 +174,13 @@ class ReviewWindow(tk.Toplevel):
         mode_label = {'Editar': tr(self.lang, 'mode_edit'), 'Calibrar': tr(self.lang, 'mode_calibrate'), 'Medir': tr(self.lang, 'mode_measure'), 'MedirPontos': tr(self.lang, 'mode_landmarks')}.get(self.mode.get(), self.mode.get())
         self.canvas.delete('all')
         self.canvas.create_image(cw / 2, ch / 2, image=self.photo)
-        self.info.config(text=f"{tr(self.lang, 'frame')} {self.index + 1}/{len(self.data.landmarks)} | {self.index / self.data.fps:.2f}s | {mode_label}")
+        records = [r for r in self.data.tracking_records if r['frame'] == self.index]
+        quality = ', '.join(f"{r['landmark']}: {r['state']}" for r in records)
+        self.info.config(text=f"{tr(self.lang, 'frame')} {self.index + 1}/{len(self.data.landmarks)} | {self.index / self.data.fps:.2f}s | {mode_label}" + (f' | {quality}' if quality else ''))
 
     def click(self, e):
+        if self.tracking:
+            return
         x, y = ((e.x - self.ox) / self.scale, (e.y - self.oy) / self.scale)
         if not (0 <= x < self.data.width and 0 <= y < self.data.height):
             return
@@ -154,10 +188,11 @@ class ReviewWindow(tk.Toplevel):
             self.calibration_clicks.append((x, y))
             if len(self.calibration_clicks) == 2:
                 cm = simpledialog.askfloat(tr(self.lang, 'distance'), tr(self.lang, 'distance_prompt'), minvalue=0.01, parent=self)
-                if cm:
-                    self.push_action({'type': 'calibration', 'points': self.data.calibration_points, 'cm': self.data.calibration_cm})
+                if cm and np.isfinite(cm) and np.linalg.norm(np.asarray(self.calibration_clicks[0]) - self.calibration_clicks[1]) >= 1:
+                    action = {'type': 'calibration', 'points': self.data.calibration_points, 'cm': self.data.calibration_cm}
                     self.data.calibration_points = tuple(self.calibration_clicks)
                     self.data.calibration_cm = cm
+                    self.push_action(action)
                     self.measure_button.config(state='normal')
                     self.landmark_measure_button.config(state='normal')
                     messagebox.showinfo(tr(self.lang, 'calibrated'), f'{self.data.px_per_cm:.2f} pixels/cm', parent=self)
@@ -214,10 +249,9 @@ class ReviewWindow(tk.Toplevel):
             old = points[landmark, :2].copy()
             new = np.array([x, y], dtype=float)
             delta = new - old
-            points[landmark, :2] = new
-            points[landmark, 2] = 1.0
             self.selected = None
             self.show()
+            self.playing = False
             self.tracking = True
             self.export_button.config(state='disabled')
             self.undo_button.config(state='disabled')
@@ -225,73 +259,54 @@ class ReviewWindow(tk.Toplevel):
             threading.Thread(target=self.propagate, args=(self.index, landmark, new, delta, snapshot), daemon=True).start()
 
     def propagate(self, start, landmark, position, delta, snapshot):
-        """CSRT segue a aparencia da bolinha; a mascara branca refina seu centro."""
-        cap = cv2.VideoCapture(str(self.data.input_path))
-        cap.set(cv2.CAP_PROP_POS_FRAMES, start)
-        ok, initial = cap.read()
-        previous = position.copy()
-        tracker = None
-        if ok:
-            factory = getattr(cv2, 'TrackerCSRT_create', None) or getattr(getattr(cv2, 'legacy', None), 'TrackerCSRT_create', None)
-            if factory:
-                tracker = factory()
-                size = 36
-                tracker.init(initial, (int(position[0] - size / 2), int(position[1] - size / 2), size, size))
-        limit = len(self.data.landmarks)
-        for k in range(start + 1, limit):
-            ok, frame = cap.read()
-            if not ok:
-                break
-            future = self.data.landmarks[k]
-            if future is None:
-                continue
-            tracked_ok, box = tracker.update(frame) if tracker else (False, None)
-            if tracked_ok:
-                bx, by, bw, bh = box
-                prediction = np.array([bx + bw / 2, by + bh / 2])
-                radius = int(max(24, min(65, max(bw, bh) * 1.4)))
-            else:
-                prediction = previous
-                radius = 65
-            hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-            cx, cy = map(int, prediction)
-            x0, x1 = (max(0, cx - radius), min(frame.shape[1], cx + radius))
-            y0, y1 = (max(0, cy - radius), min(frame.shape[0], cy + radius))
-            roi = hsv[y0:y1, x0:x1]
-            mask = cv2.inRange(roi, np.array([0, 0, 205]), np.array([180, 75, 255]))
-            mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
-            count, labels, stats, centroids = cv2.connectedComponentsWithStats(mask)
-            candidates = []
-            for n in range(1, count):
-                area, w, h = (stats[n, cv2.CC_STAT_AREA], stats[n, cv2.CC_STAT_WIDTH], stats[n, cv2.CC_STAT_HEIGHT])
-                if 8 <= area <= 1200 and 0.55 <= w / max(h, 1) <= 1.8:
-                    p = centroids[n] + np.array([x0, y0])
-                    candidates.append((np.linalg.norm(p - prediction), p))
-            if candidates:
-                _, tracked = min(candidates, key=lambda item: item[0])
-                future[landmark, :2] = tracked
-                future[landmark, 2] = 1.0
-                previous = tracked
-            elif tracked_ok:
-                future[landmark, :2] = prediction
-                future[landmark, 2] = 1.0
-                previous = prediction
-            else:
-                weight = float(np.exp(-(k - start) / 45.0))
-                future[landmark, :2] += delta * weight
-                future[landmark, 2] = max(future[landmark, 2], 0.75 * weight)
-                previous = future[landmark, :2].copy()
-        cap.release()
-        self.after(0, lambda: self.tracking_done(landmark, snapshot))
+        # The worker reads isolated arrays; only the UI thread commits a complete result.
+        sequence = [None if p is None else p.copy() for p in self.data.landmarks]
+        try:
+            options = TrackingOptions(use_optical_flow=self.opts.tracking_use_optical_flow,
+                                      smoothing_seconds=self.opts.tracking_smoothing_seconds)
+            batch = LandmarkTracker(options).run(self.data.input_path, sequence, start, landmark,
+                                          position, self.data.fps, self.closed)
+        except Exception as exc:
+            self.tracking_events.put((landmark, snapshot, None, str(exc)))
+        else:
+            self.tracking_events.put((landmark, snapshot, batch, None))
 
-    def tracking_done(self, landmark, snapshot):
-        self.tracking = False
-        self.export_button.config(state='normal')
-        self.push_action({'type': 'point', 'landmark': landmark, 'snapshot': snapshot})
+    def poll_tracking(self):
+        if self.closed.is_set():
+            return
+        try:
+            landmark, snapshot, batch, error = self.tracking_events.get_nowait()
+        except queue.Empty:
+            pass
+        else:
+            self.tracking = False
+            self.export_button.config(state='normal')
+            self.undo_button.config(state='normal' if self.undo_stack else 'disabled')
+            if error:
+                self.data.record('tracking_failed', landmark=landmark, error=error)
+                self.persist()
+                messagebox.showerror('Erro', error, parent=self)
+            elif not batch.cancelled:
+                self.tracking_done(landmark, snapshot, batch)
+            self.show()
+        self.after(100, self.poll_tracking)
+
+    def tracking_done(self, landmark, snapshot, batch):
+        previous_records = list(self.data.tracking_records)
+        for index, value in batch.updates:
+            if self.data.landmarks[index] is not None:
+                self.data.landmarks[index][landmark] = value
+        affected = {(record['frame'], record['landmark']) for record in batch.records}
+        self.data.tracking_records = [record for record in self.data.tracking_records
+                                      if (record['frame'], record['landmark']) not in affected] + batch.records
+        self.data.record('tracking_result', landmark=landmark, records=batch.records, after=batch.updates)
+        self.push_action({'type': 'point', 'landmark': landmark, 'snapshot': snapshot,
+                          'previous_records': previous_records})
+        self.visual_frames = VisualContinuity(self.opts).build(self.data.landmarks, self.data.fps)
         if self.opts.view == 'Lateral':
             self.ear_centers = [ear_center(p) for p in self.data.landmarks]
-        self.info.config(text='Rastreamento concluido: marca branca priorizada; estimativa automatica usada quando necessario.')
-        self.show()
+        lost = sum(record['state'] in ('lost', 'suspect') for record in batch.records)
+        self.info.config(text=f'Rastreamento concluido. Quadros sem alvo confirmado: {lost}.')
 
     def toggle(self):
         self.playing = not self.playing
@@ -308,6 +323,10 @@ class ReviewWindow(tk.Toplevel):
         self.after(max(15, int(1000 / self.data.fps)), self.step)
 
     def close(self):
+        if not self.persist():
+            return
+        self.closed.set()
+        self.master.start_button.config(state='normal')
         self.playing = False
         self.cap.release()
         self.destroy()

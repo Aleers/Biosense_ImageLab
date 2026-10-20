@@ -1,10 +1,20 @@
 from __future__ import annotations
-import csv, math
-from dataclasses import dataclass, field
+import math
+from datetime import datetime, timezone
+from uuid import uuid4
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Callable
 import cv2, mediapipe as mp, numpy as np
 from i18n import tr
+from joint_angles import JointAngleCalculator, JOINT_DEFINITIONS, angle_2d
+from csv_exporter import CsvExporter
+from landmark_quality import LandmarkValidator
+from session import SessionStore, json_safe
+from temporal_filter import TemporalLandmarkFilter
+from artifact_io import ArtifactPublisher
+from gait_events import GaitPhaseAnalyzer, FootfallRegistry
+from visual_continuity import VisualContinuity, draw_joint_labels, dashed_line
 
 def text_width(text, scale, thickness=2):
     """Calcula a largura usando a mesma fonte ASCII desenhada pelo OpenCV."""
@@ -27,6 +37,10 @@ class ProcessingOptions:
     side: str = 'Automatico'
     visibility_threshold: float = 0.45
     language: str = 'pt'
+    smoothing_seconds: float = 0.0
+    tracking_use_optical_flow: bool = False
+    tracking_smoothing_seconds: float = 0.0
+    visual_hold_seconds: float = 0.20
 
 @dataclass
 class Analysis:
@@ -46,17 +60,51 @@ class Analysis:
     manual_segments: list[dict] = field(default_factory=list)
     tracked_segments: list[dict] = field(default_factory=list)
 
+    raw_landmarks: tuple = field(default_factory=tuple)
+    timestamps: list[float] = field(default_factory=list)
+    tracking_records: list[dict] = field(default_factory=list)
+    gait_records: list[dict] = field(default_factory=list)
+    display_records: list[dict] = field(default_factory=list)
+    review_history: list[dict] = field(default_factory=list)
+    audit: list[dict] = field(default_factory=list)
+    session_id: str = field(default_factory=lambda: uuid4().hex)
+    session_path: Path | None = None
+    source_identity: dict = field(default_factory=dict)
+    software_identity: dict = field(default_factory=dict)
+    saved_options: dict = field(default_factory=dict)
+    full_precision_rows: list[dict] = field(default_factory=list)
+
+    def capture_originals(self, sequence=None):
+        if self.raw_landmarks:
+            return
+        originals = []
+        for points in self.landmarks if sequence is None else sequence:
+            if points is None:
+                originals.append(None)
+            else:
+                original = points.copy()
+                original.setflags(write=False)
+                originals.append(original)
+        self.raw_landmarks = tuple(originals)
+        if not self.timestamps:
+            self.timestamps = [i / self.fps for i in range(len(self.landmarks))]
+
+    def record(self, action, **details):
+        event = json_safe(dict(id=len(self.audit)+1, action=action,
+                         timestamp=datetime.now(timezone.utc).isoformat(), **details))
+        self.audit.append(event)
+        if action in ('tracking_result', 'review_action', 'undo', 'temporal_filter', 'side_identity_correction'):
+            self.full_precision_rows = []
+            self.gait_records = []
+            self.display_records = []
+        return event['id']
+
     @property
     def px_per_cm(self):
-        if not self.calibration_points or not self.calibration_cm:
-            return None
-        a, b = map(np.asarray, self.calibration_points)
-        return float(np.linalg.norm(a - b) / self.calibration_cm)
+        return LandmarkValidator.scale(self.calibration_points, self.calibration_cm)
 
 def angle(a, b, c):
-    ba, bc = (np.asarray(a) - np.asarray(b), np.asarray(c) - np.asarray(b))
-    den = np.linalg.norm(ba) * np.linalg.norm(bc)
-    return float('nan') if den < 1e-08 else math.degrees(math.acos(float(np.clip(np.dot(ba, bc) / den, -1, 1))))
+    return angle_2d(a, b, c)
 
 class PoseVideoAnalyzer:
     """Le o video e converte cada quadro em landmarks do MediaPipe.
@@ -65,38 +113,55 @@ class PoseVideoAnalyzer:
     correcoes manuais e a exportacao permanecem em etapas separadas.
     """
 
-    def __init__(self, language='pt', progress=None):
+    def __init__(self, language='pt', progress=None, smoothing_seconds=0.0):
         self.language = language
         self.progress = progress
+        self.smoothing_seconds = smoothing_seconds
 
     def analyze(self, path: Path):
         cap = cv2.VideoCapture(str(path))
         if not cap.isOpened():
+            cap.release()
             raise ValueError('Nao foi possivel abrir o video.')
-        fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        total = max(1, int(cap.get(cv2.CAP_PROP_FRAME_COUNT)))
-        data = Analysis(path, fps, width, height)
-        pose = mp.solutions.pose
-        with pose.Pose(model_complexity=2, smooth_landmarks=True, min_detection_confidence=0.5, min_tracking_confidence=0.5) as model:
-            frame_number = 0
-            while True:
-                ok, frame = cap.read()
-                if not ok:
-                    break
-                result = model.process(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-                found = result.pose_landmarks
-                points = None
-                if found:
-                    points = np.array([[p.x * width, p.y * height, p.visibility] for p in found.landmark], dtype=np.float32)
-                data.landmarks.append(points)
-                frame_number += 1
-                self._report_progress(frame_number, total)
-        cap.release()
+        try:
+            fps = cap.get(cv2.CAP_PROP_FPS)
+            if not np.isfinite(fps) or fps <= 0:
+                raise ValueError('FPS invalido; nao e possivel garantir a escala temporal.')
+            width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            if width <= 0 or height <= 0:
+                raise ValueError('Dimensoes invalidas do video.')
+            reported_total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            total = max(1, reported_total)
+            data = Analysis(Path(path), fps, width, height)
+            pose = mp.solutions.pose
+            with pose.Pose(model_complexity=2, smooth_landmarks=True, min_detection_confidence=0.5, min_tracking_confidence=0.5) as model:
+                frame_number = 0
+                while True:
+                    ok, frame = cap.read()
+                    if not ok:
+                        if reported_total > 0 and frame_number < reported_total:
+                            raise ValueError(f'Leitura incompleta: quadro {frame_number} de {reported_total}.')
+                        break
+                    found = model.process(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)).pose_landmarks
+                    points = None
+                    if found:
+                        points = np.array([[p.x*width, p.y*height, p.visibility] for p in found.landmark], dtype=np.float32)
+                    data.landmarks.append(points)
+                    frame_number += 1
+                    self._report_progress(frame_number, total)
+        finally:
+            cap.release()
         if not data.landmarks:
             raise ValueError('O video nao contem quadros validos.')
+        data.capture_originals()
+        data.record('detection', frames=len(data.landmarks), model='mediapipe_pose', model_complexity=2,
+                    builtin_smoothing=True, timestamp_source='nominal_fps')
         stabilize_lower_limbs(data)
+        if self.smoothing_seconds > 0:
+            smoother = TemporalLandmarkFilter(self.smoothing_seconds)
+            data.landmarks = [smoother.update(points, timestamp) for points, timestamp in zip(data.landmarks, data.timestamps)]
+            data.record('temporal_filter', time_constant_seconds=self.smoothing_seconds)
         return data
 
     def _report_progress(self, frame_number, total):
@@ -104,72 +169,53 @@ class PoseVideoAnalyzer:
             message = f"{tr(self.language, 'detecting')}: {frame_number} {tr(self.language, 'of')} {total}..."
             self.progress(min(99, frame_number * 100 / total), message)
 
-def analyze_video(path: Path, progress: Callable | None=None, language='pt'):
+def analyze_video(path: Path, progress: Callable | None=None, language='pt', smoothing_seconds=0.0):
     """Fachada mantida para compatibilidade com a interface existente."""
-    return PoseVideoAnalyzer(language, progress).analyze(path)
+    return PoseVideoAnalyzer(language, progress, smoothing_seconds).analyze(path)
 
 def stabilize_lower_limbs(data):
     """Mantem a identidade esquerda/direita e fixa o lado predominante do video."""
+    data.capture_originals()
     pose = mp.solutions.pose.PoseLandmark
     names = ('HIP', 'KNEE', 'ANKLE', 'HEEL', 'FOOT_INDEX')
     pairs = [(int(getattr(pose, f'LEFT_{n}')), int(getattr(pose, f'RIGHT_{n}'))) for n in names]
     scores = {'left': [], 'right': []}
     previous = None
-    for points in data.landmarks:
+    for frame_index, points in enumerate(data.landmarks):
         if points is None:
+            previous = None
             continue
-        scores['left'].append(np.mean([points[a, 2] for a, _ in pairs]))
-        scores['right'].append(np.mean([points[b, 2] for _, b in pairs]))
-        if previous is not None:
+        if previous is not None and LandmarkValidator().valid(points, tuple(i for pair in pairs for i in pair)) and LandmarkValidator().valid(previous, tuple(i for pair in pairs for i in pair)):
             normal = sum((np.linalg.norm(points[a, :2] - previous[a, :2]) + np.linalg.norm(points[b, :2] - previous[b, :2]) for a, b in pairs))
             swapped = sum((np.linalg.norm(points[b, :2] - previous[a, :2]) + np.linalg.norm(points[a, :2] - previous[b, :2]) for a, b in pairs))
             if swapped < normal * 0.72:
-                for a, b in pairs:
+                swapped_pairs = list(pairs)
+                ls, rs = int(pose.LEFT_SHOULDER), int(pose.RIGHT_SHOULDER)
+                if LandmarkValidator().valid(points, (ls, rs)) and LandmarkValidator().valid(previous, (ls, rs)):
+                    direct = np.linalg.norm(points[ls, :2]-previous[ls, :2])+np.linalg.norm(points[rs, :2]-previous[rs, :2])
+                    reverse = np.linalg.norm(points[rs, :2]-previous[ls, :2])+np.linalg.norm(points[ls, :2]-previous[rs, :2])
+                    if reverse < direct*0.72:
+                        swapped_pairs.append((ls, rs))
+                for a, b in swapped_pairs:
                     points[[a, b]] = points[[b, a]]
+                data.record('side_identity_correction', frame=frame_index, pairs=swapped_pairs)
             for a, b in pairs:
                 for idx in (a, b):
                     if points[idx, 2] < 0.42 and previous[idx, 2] >= 0.42:
                         points[idx, :2] = previous[idx, :2]
-                        points[idx, 2] = 0.42
+                        points[idx, 2] = min(points[idx, 2], 0.42)
+        scores['left'].append(float(np.nanmean([points[a, 2] for a, _ in pairs])))
+        scores['right'].append(float(np.nanmean([points[b, 2] for _, b in pairs])))
         previous = points.copy()
     data.predominant_side = max(scores, key=lambda s: np.median(scores[s]) if scores[s] else 0)
 
-def gait_phases(data):
-    """Heuristica 2D: proximidade do solo + baixa velocidade do pe."""
-    pose = mp.solutions.pose.PoseLandmark
-    result = {}
-    for side in ('left', 'right'):
-        heel = int(getattr(pose, f'{side.upper()}_HEEL'))
-        toe = int(getattr(pose, f'{side.upper()}_FOOT_INDEX'))
-        centers = []
-        lowest = []
-        for p in data.landmarks:
-            if p is None:
-                centers.append(None)
-                lowest.append(np.nan)
-            else:
-                centers.append((p[heel, :2] + p[toe, :2]) / 2)
-                lowest.append(max(p[heel, 1], p[toe, 1]))
-        valid = np.array([v for v in lowest if np.isfinite(v)])
-        ground = np.percentile(valid, 90) if len(valid) else data.height
-        speed = np.zeros(len(centers))
-        for i in range(1, len(centers)):
-            if centers[i] is not None and centers[i - 1] is not None:
-                speed[i] = np.linalg.norm(centers[i] - centers[i - 1])
-        moving = speed[speed > 0]
-        speed_limit = np.percentile(moving, 55) if len(moving) else 8
-        raw = np.array([np.isfinite(y) and y > ground - data.height * 0.045 and (speed[i] <= max(5, speed_limit)) for i, y in enumerate(lowest)], dtype=float)
-        smooth = np.convolve(raw, np.ones(7) / 7, mode='same') >= 0.5
-        events = [''] * len(smooth)
-        for i in range(1, len(smooth)):
-            if smooth[i] and (not smooth[i - 1]):
-                events[i] = 'CONTATO INICIAL'
-            elif not smooth[i] and smooth[i - 1]:
-                events[i] = 'RETIRADA DO PE'
-        result[side] = {'stance': smooth, 'event': events, 'centers': centers}
-    return result
+def gait_phases(data, visibility_threshold=0.45):
+    """Compatibility facade for time-based phase confirmation."""
+    return GaitPhaseAnalyzer(visibility_threshold).analyze(data)
 
-def draw_angle_table(frame, current, running, lang='pt'):
+
+def draw_angle_table(frame, current, running, lang='pt', status=None):
+    status = status or {}
     keys = [k for k in current if k.endswith('_deg') and any((tag in k for tag in ('_hip_', '_knee_', '_ankle_', '_q_estimated_')))]
     if not keys:
         return
@@ -179,8 +225,8 @@ def draw_angle_table(frame, current, running, lang='pt'):
         parts = key.split('_')
         name = f'{labels.get(parts[0], parts[0])} {labels.get(parts[1], parts[1])}'
         v = current[key]
-        mn, mx = running[key]
-        rows.append((name, v, mn, mx))
+        mn, mx = running.get(key, (None, None))
+        rows.append((name, v, mn, mx, status.get(key)))
     name_w = max([text_width(r[0], 0.61, 2) for r in rows] + [text_width(tr(lang, 'measure_col'), 0.61, 2)])
     x_name = 20
     x_current = x_name + name_w + 34
@@ -192,34 +238,36 @@ def draw_angle_table(frame, current, running, lang='pt'):
     cv2.putText(frame, tr(lang, 'angles'), (20, 88), cv2.FONT_HERSHEY_SIMPLEX, 0.76, (255, 255, 255), 2, cv2.LINE_AA)
     for text, x in ((tr(lang, 'measure_col'), x_name), (tr(lang, 'current'), x_current), (tr(lang, 'min'), x_min), (tr(lang, 'max'), x_max)):
         cv2.putText(frame, text, (x, 116), cv2.FONT_HERSHEY_SIMPLEX, 0.61, (220, 225, 235), 2, cv2.LINE_AA)
-    for row, (name, v, mn, mx) in enumerate(rows):
+    for row, (name, v, mn, mx, state) in enumerate(rows):
         y = 148 + 32 * row
         cv2.putText(frame, name, (x_name, y), cv2.FONT_HERSHEY_SIMPLEX, 0.61, (235, 242, 255), 2, cv2.LINE_AA)
         for value, x in ((v, x_current), (mn, x_min), (mx, x_max)):
-            cv2.putText(frame, f'{value:.1f}', (x, y), cv2.FONT_HERSHEY_SIMPLEX, 0.61, (235, 242, 255), 2, cv2.LINE_AA)
+            label = '--' if value is None or not np.isfinite(value) else f'{value:.1f}'
+            if x == x_current and state == 'held':
+                label += '~'
+            cv2.putText(frame, label, (x, y), cv2.FONT_HERSHEY_SIMPLEX, 0.61, (235, 242, 255), 2, cv2.LINE_AA)
 
-def stepdown_metrics(points, px_per_cm=None):
-    if points is None:
-        return {}
-    pose = mp.solutions.pose.PoseLandmark
+def stepdown_metrics(points, px_per_cm=None, visibility_threshold=0.45):
+    validator = LandmarkValidator(visibility_threshold)
     out = {}
-    lh, rh = (int(pose.LEFT_HIP), int(pose.RIGHT_HIP))
-    ls, rs = (int(pose.LEFT_SHOULDER), int(pose.RIGHT_SHOULDER))
-    pelvis = points[rh, :2] - points[lh, :2]
-    out['pelvic_tilt_deg'] = math.degrees(math.atan2(pelvis[1], pelvis[0]))
-    shoulder_mid = (points[ls, :2] + points[rs, :2]) / 2
-    hip_mid = (points[lh, :2] + points[rh, :2]) / 2
-    trunk = shoulder_mid - hip_mid
-    out['trunk_lean_deg'] = math.degrees(math.atan2(trunk[0], -trunk[1]))
-    for side in ('left', 'right'):
-        pre = side.upper()
-        hip = int(getattr(pose, f'{pre}_HIP'))
-        knee = int(getattr(pose, f'{pre}_KNEE'))
-        ankle = int(getattr(pose, f'{pre}_ANKLE'))
-        out[f'{side}_fppa_deg'] = 180 - angle(points[hip, :2], points[knee, :2], points[ankle, :2])
-        offset = float(points[knee, 0] - points[ankle, 0])
-        out[f'{side}_knee_foot_offset_cm'] = offset / px_per_cm if px_per_cm else offset
+    if validator.valid(points, (23, 24)):
+        pelvis = points[24, :2]-points[23, :2]
+        if np.linalg.norm(pelvis) > 1e-8:
+            out['pelvic_tilt_deg'] = math.degrees(math.atan2(pelvis[1], pelvis[0]))
+    if validator.valid(points, (11, 12, 23, 24)):
+        trunk = (points[11, :2]+points[12, :2]-points[23, :2]-points[24, :2])/2
+        if np.linalg.norm(trunk) > 1e-8:
+            out['trunk_lean_deg'] = math.degrees(math.atan2(trunk[0], -trunk[1]))
+    for side, hip, knee, ankle in [('left', 23, 25, 27), ('right', 24, 26, 28)]:
+        if validator.valid(points, (hip, knee, ankle)):
+            value = angle(points[hip, :2], points[knee, :2], points[ankle, :2])
+            if np.isfinite(value):
+                out[f'{side}_fppa_deg'] = 180-value
+        if validator.valid(points, (knee, ankle)):
+            offset = float(points[knee, 0]-points[ankle, 0])
+            out[f'{side}_knee_foot_offset_cm'] = offset/px_per_cm if px_per_cm else offset
     return out
+
 
 def draw_stepdown_panel(frame, current, running, calibrated, lang='pt'):
     le = 'E' if lang != 'en' else 'L'
@@ -231,6 +279,8 @@ def draw_stepdown_panel(frame, current, running, calibrated, lang='pt'):
         if key not in current:
             continue
         v = current[key]
+        if key not in running or not np.isfinite(v):
+            continue
         mn, mx = running[key]
         unit = 'cm' if key.endswith('_cm') and calibrated else 'px' if key.endswith('_cm') else 'deg'
         rows.append((labels[key], v, mn, mx, unit, (210, 160, 255) if 'fppa' in key else (80, 220, 255)))
@@ -271,7 +321,8 @@ def draw_right_panel(frame, phase_rows, steps, strides, lang='pt'):
     cv2.putText(frame, tr(lang, 'strides'), (right, 184), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 120, 220), 2, cv2.LINE_AA)
     side_colors = {'E': (30, 230, 255), 'D': (255, 170, 30), 'L': (30, 230, 255), 'R': (255, 170, 30)}
     for n, (number, side, value) in enumerate(steps):
-        cv2.putText(frame, f'{number:02d} ({side})  {value:6.1f} cm', (left, 211 + n * row_h), cv2.FONT_HERSHEY_SIMPLEX, font, side_colors[side], 2, cv2.LINE_AA)
+        value_label = '--' if value is None else f'{value:6.1f}'
+        cv2.putText(frame, f'{number:02d} ({side})  {value_label} cm', (left, 211 + n * row_h), cv2.FONT_HERSHEY_SIMPLEX, font, side_colors[side], 2, cv2.LINE_AA)
     for n, (number, side, value) in enumerate(strides):
         cv2.putText(frame, f'{number:02d} ({side})  {value:6.1f} cm', (right, 211 + n * row_h), cv2.FONT_HERSHEY_SIMPLEX, font, side_colors[side], 2, cv2.LINE_AA)
 
@@ -289,81 +340,64 @@ def ear_center(points):
     if points is None:
         return None
     ids = [int(mp.solutions.pose.PoseLandmark.LEFT_EAR), int(mp.solutions.pose.PoseLandmark.RIGHT_EAR)]
-    visible = [points[i, :2] for i in ids if points[i, 2] >= 0.35]
+    visible = [points[i, :2] for i in ids if LandmarkValidator(0.35).valid(points, (i,))]
     return np.mean(visible, axis=0) if visible else None
 
-def draw_overlay(frame, points, opts, calibration=None, editable=False, ear_trail=None):
+def draw_overlay(frame, points, opts, calibration=None, editable=False, ear_trail=None, display=None, draw_labels=True):
     frame = frame.copy()
-    metrics = {}
-    if points is None:
-        cv2.putText(frame, 'Pessoa nao detectada', (20, 75), cv2.FONT_HERSHEY_SIMPLEX, 1, (30, 30, 230), 3)
-        return (frame, metrics)
     pose = mp.solutions.pose.PoseLandmark
-    for a, b in mp.solutions.pose.POSE_CONNECTIONS:
-        if points[a, 2] >= opts.visibility_threshold and points[b, 2] >= opts.visibility_threshold:
-            cv2.line(frame, tuple(points[a, :2].astype(int)), tuple(points[b, :2].astype(int)), (255, 180, 30), 3)
-    for p in points:
-        if p[2] >= opts.visibility_threshold:
-            cv2.circle(frame, tuple(p[:2].astype(int)), 7 if editable else 5, (60, 230, 60), -1)
-    scores = {s: np.mean([points[int(getattr(pose, f'{s.upper()}_{j}')), 2] for j in ('HIP', 'KNEE', 'ANKLE')]) for s in ('left', 'right')}
-    sides = {'Esquerdo': ['left'], 'Direito': ['right'], 'Ambos': ['left', 'right']}.get(opts.side) or [max(scores, key=scores.get)]
-    for side in sides:
-        ids = {n: int(getattr(pose, f'{side.upper()}_{n}')) for n in ('SHOULDER', 'HIP', 'KNEE', 'ANKLE', 'FOOT_INDEX')}
-        for joint, names in {'hip': ('SHOULDER', 'HIP', 'KNEE'), 'knee': ('HIP', 'KNEE', 'ANKLE'), 'ankle': ('KNEE', 'ANKLE', 'FOOT_INDEX')}.items():
-            ix = [ids[n] for n in names]
-            if min((points[k, 2] for k in ix)) < opts.visibility_threshold:
+    if display is not None:
+        sides=display.sides
+    else:
+        scores={side: np.mean([points[int(getattr(pose,f'{side.upper()}_{joint}')),2] for joint in ('HIP','KNEE','ANKLE')])
+                if points is not None else 0 for side in ('left','right')}
+        sides={'Esquerdo':('left',),'Direito':('right',),'Ambos':('left','right')}.get(opts.side) or (max(scores,key=scores.get),)
+    calculator=JointAngleCalculator(opts.visibility_threshold)
+    metrics=calculator.calculate(points,sides)
+    if opts.view=='Frontal':
+        both=calculator.calculate(points,('left','right'))
+        for side in ('left','right'):
+            if f'{side}_knee_deg' in both:
+                metrics[f'{side}_q_estimated_deg']=180-both[f'{side}_knee_deg']
+    rendered=display.points if display is not None else points
+    if rendered is not None:
+        for a,b in mp.solutions.pose.POSE_CONNECTIONS:
+            if not np.all(np.isfinite(rendered[[a,b],:2])):
                 continue
-            value = angle(points[ix[0], :2], points[ix[1], :2], points[ix[2], :2])
-            metrics[f'{side}_{joint}_deg'] = value
-            x, y = points[ix[1], :2].astype(int)
-            color = (30, 230, 255) if side == 'left' else (255, 170, 30)
-            side_letter = ('L' if side == 'left' else 'R') if opts.language == 'en' else 'E' if side == 'left' else 'D'
-            label = f'{side_letter} {tr(opts.language, joint)}: {value:.1f} deg'
-            cv2.putText(frame, label, (x + 10, y - 12), cv2.FONT_HERSHEY_SIMPLEX, 0.92, (0, 0, 0), 6, cv2.LINE_AA)
-            cv2.putText(frame, label, (x + 10, y - 12), cv2.FONT_HERSHEY_SIMPLEX, 0.92, color, 3, cv2.LINE_AA)
-        if opts.view == 'Frontal':
-            hip, knee, ankle = (ids['HIP'], ids['KNEE'], ids['ANKLE'])
-            if min((points[k, 2] for k in (hip, knee, ankle))) >= opts.visibility_threshold:
-                q_value = 180.0 - angle(points[hip, :2], points[knee, :2], points[ankle, :2])
-                metrics[f'{side}_q_estimated_deg'] = q_value
-                x, y = points[knee, :2].astype(int)
-                side_letter = ('L' if side == 'left' else 'R') if opts.language == 'en' else 'E' if side == 'left' else 'D'
-                label = f"{tr(opts.language, 'q')} {side_letter}: {q_value:.1f} deg"
-                cv2.putText(frame, label, (x + 10, y + 30), cv2.FONT_HERSHEY_SIMPLEX, 0.86, (0, 0, 0), 6, cv2.LINE_AA)
-                cv2.putText(frame, label, (x + 10, y + 30), cv2.FONT_HERSHEY_SIMPLEX, 0.86, (210, 80, 255), 3, cv2.LINE_AA)
-    if opts.view == 'Frontal':
-        for q_side in ('left', 'right'):
-            key = f'{q_side}_q_estimated_deg'
-            if key in metrics:
+            if display is not None and (display.landmark_status[a]!='measured' or display.landmark_status[b]!='measured'):
+                color=(30,170,255) if 'held' in (display.landmark_status[a],display.landmark_status[b]) else (140,140,140)
+                dashed_line(frame,rendered[a,:2],rendered[b,:2],color)
+            elif LandmarkValidator(opts.visibility_threshold).valid(rendered,(a,b)):
+                cv2.line(frame,tuple(rendered[a,:2].astype(int)),tuple(rendered[b,:2].astype(int)),(255,180,30),3)
+        for index,point in enumerate(rendered):
+            if not np.all(np.isfinite(point[:2])):
                 continue
-            pre = q_side.upper()
-            hip = int(getattr(pose, f'{pre}_HIP'))
-            knee = int(getattr(pose, f'{pre}_KNEE'))
-            ankle = int(getattr(pose, f'{pre}_ANKLE'))
-            if min((points[k, 2] for k in (hip, knee, ankle))) >= opts.visibility_threshold:
-                q_value = 180.0 - angle(points[hip, :2], points[knee, :2], points[ankle, :2])
-                metrics[key] = q_value
-                x, y = points[knee, :2].astype(int)
-                side_letter = ('L' if q_side == 'left' else 'R') if opts.language == 'en' else 'E' if q_side == 'left' else 'D'
-                label = f"{tr(opts.language, 'q')} {side_letter}: {q_value:.1f} deg"
-                cv2.putText(frame, label, (x + 10, y + 30), cv2.FONT_HERSHEY_SIMPLEX, 0.86, (0, 0, 0), 6, cv2.LINE_AA)
-                cv2.putText(frame, label, (x + 10, y + 30), cv2.FONT_HERSHEY_SIMPLEX, 0.86, (210, 80, 255), 3, cv2.LINE_AA)
+            state=display.landmark_status[index] if display is not None else 'measured'
+            if display is None and not LandmarkValidator(opts.visibility_threshold).valid(rendered,(index,)):
+                continue
+            color=(60,230,60) if state=='measured' else (30,170,255) if state=='held' else (140,140,140)
+            cv2.circle(frame,tuple(point[:2].astype(int)),7 if editable else 5,color,-1 if state=='measured' else 2)
+    if draw_labels:
+        draw_joint_labels(frame,rendered,display.metrics if display is not None else metrics,opts,
+                          display.status if display is not None else None)
+    if points is None:
+        cv2.putText(frame,tr(opts.language,'signal_lost'),(20,45),cv2.FONT_HERSHEY_SIMPLEX,.7,(30,30,230),2)
     if calibration:
-        a, b = (tuple(map(int, p)) for p in calibration)
-        cv2.line(frame, a, b, (220, 40, 220), 4)
-        cv2.circle(frame, a, 8, (220, 40, 220), -1)
-        cv2.circle(frame, b, 8, (220, 40, 220), -1)
-    if opts.view == 'Lateral' and ear_trail:
-        trail = [tuple(np.asarray(p).astype(int)) for p in ear_trail if p is not None]
-        if len(trail) > 1:
-            cv2.polylines(frame, [np.asarray(trail, dtype=np.int32)], False, (30, 80, 255), 4, cv2.LINE_AA)
-        center = ear_center(points)
+        a,b=(tuple(map(int,p)) for p in calibration)
+        cv2.line(frame,a,b,(220,40,220),4)
+        cv2.circle(frame,a,8,(220,40,220),-1)
+        cv2.circle(frame,b,8,(220,40,220),-1)
+    if opts.view=='Lateral' and ear_trail:
+        trail=[tuple(np.asarray(p).astype(int)) for p in ear_trail if p is not None]
+        if len(trail)>1:
+            cv2.polylines(frame,[np.asarray(trail,dtype=np.int32)],False,(30,80,255),4,cv2.LINE_AA)
+        center=ear_center(points)
         if center is not None:
-            cv2.circle(frame, tuple(center.astype(int)), 9, (30, 80, 255), -1)
-            cv2.circle(frame, tuple(center.astype(int)), 12, (255, 255, 255), 2)
-    return (frame, metrics)
+            cv2.circle(frame,tuple(center.astype(int)),9,(30,80,255),-1)
+    return frame,metrics
 
-def draw_manual_segments(frame, data, lang='pt', points=None):
+
+def draw_manual_segments(frame, data, lang='pt', points=None, visibility_threshold=0.45):
     if not data.manual_segments and (not data.tracked_segments) or not data.px_per_cm:
         return frame
     values = []
@@ -383,6 +417,8 @@ def draw_manual_segments(frame, data, lang='pt', points=None):
     if points is not None:
         for segment in data.tracked_segments:
             color = tuple(segment.get('color', (255, 210, 60)))
+            if not LandmarkValidator(visibility_threshold).valid(points, (segment['i1'], segment['i2'])):
+                continue
             a = points[segment['i1'], :2]
             b = points[segment['i2'], :2]
             value = float(np.linalg.norm(a - b) / data.px_per_cm)
@@ -408,143 +444,136 @@ def draw_manual_segments(frame, data, lang='pt', points=None):
         cv2.putText(frame, f'{name}: {value:.1f} cm', (20, y0 + 56 + i * row_h), cv2.FONT_HERSHEY_SIMPLEX, 0.62, color, 2, cv2.LINE_AA)
     return frame
 
-def _render_video(data, out_path, opts, progress=None):
+def _render_video(data, out_path, opts, progress=None, published_output=None):
+    out_path = Path(out_path)
+    if out_path.resolve() == data.input_path.resolve():
+        raise ValueError('A saida nao pode sobrescrever o video original.')
     cap = cv2.VideoCapture(str(data.input_path))
+    if not cap.isOpened():
+        cap.release()
+        raise ValueError('Nao foi possivel reabrir o video original.')
     writer = cv2.VideoWriter(str(out_path), cv2.VideoWriter_fourcc(*'mp4v'), data.fps, (data.width, data.height))
     if not writer.isOpened():
+        cap.release()
+        writer.release()
         raise ValueError('Nao foi possivel criar o video de saida.')
-    if opts.side == 'Automatico':
-        opts = ProcessingOptions(opts.view, 'Esquerdo' if data.predominant_side == 'left' else 'Direito', opts.visibility_threshold, opts.language)
-    phases = gait_phases(data) if opts.view == 'Lateral' else None
-    ear_layer = np.zeros((data.height, data.width, 3), np.uint8)
-    ear_mask = np.zeros((data.height, data.width), np.uint8)
-    rows = []
-    total = len(data.landmarks)
-    trail = []
-    first_ear = None
-    previous_ear = None
-    ear_path_px = 0.0
-    running = {}
-    stepdown_running = {}
-    last_strike = {'left': None, 'right': None}
-    last_contact_frame = {'left': -10 ** 9, 'right': -10 ** 9}
-    last_accepted_side = None
-    last_accepted_frame = -10 ** 9
-    last_footfall_x = None
-    latest_step = None
-    latest_stride = {'left': None, 'right': None}
-    step_history = []
-    stride_history = []
-    footfall_positions = []
-    for i, points in enumerate(data.landmarks):
-        ok, frame = cap.read()
-        if not ok:
-            break
-        current_ear = ear_center(points) if opts.view == 'Lateral' else None
-        if current_ear is not None:
-            trail.append(current_ear.copy())
-            first_ear = current_ear.copy() if first_ear is None else first_ear
-            if previous_ear is not None:
-                ear_path_px += float(np.linalg.norm(current_ear - previous_ear))
-                a, b = (tuple(previous_ear.astype(int)), tuple(current_ear.astype(int)))
-                cv2.line(ear_layer, a, b, (30, 80, 255), 4, cv2.LINE_AA)
-                cv2.line(ear_mask, a, b, 255, 5, cv2.LINE_AA)
-            previous_ear = current_ear.copy()
-        frame, metrics = draw_overlay(frame, points, opts, data.calibration_points, ear_trail=None)
-        if current_ear is not None:
-            cv2.copyTo(ear_layer, ear_mask, frame)
-            center = tuple(current_ear.astype(int))
-            cv2.circle(frame, center, 9, (30, 80, 255), -1)
-            cv2.circle(frame, center, 12, (255, 255, 255), 2)
-        cv2.rectangle(frame, (0, 0), (data.width, 52), (20, 20, 20), -1)
-        view_label = tr(opts.language, 'lateral' if opts.view == 'Lateral' else 'frontal')
-        cv2.putText(frame, f"{tr(opts.language, 'analysis')} | {view_label} | t={i / data.fps:.2f}s", (14, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (245, 245, 245), 3)
-        sd_metrics = stepdown_metrics(points, data.px_per_cm) if opts.view == 'Frontal' else {}
-        for key, value in metrics.items():
-            if key.endswith('_deg') and np.isfinite(value):
-                running[key] = (min(running.get(key, (value, value))[0], value), max(running.get(key, (value, value))[1], value))
-        draw_angle_table(frame, metrics, running, opts.language)
-        for key, value in sd_metrics.items():
-            if np.isfinite(value):
-                stepdown_running[key] = (min(stepdown_running.get(key, (value, value))[0], value), max(stepdown_running.get(key, (value, value))[1], value))
-        if sd_metrics:
-            draw_stepdown_panel(frame, sd_metrics, stepdown_running, data.px_per_cm is not None, opts.language)
-        row = {'frame': i, 'time_s': i / data.fps, **metrics, **sd_metrics}
-        if points is not None and data.px_per_cm:
-            la, ra = (int(mp.solutions.pose.PoseLandmark.LEFT_ANKLE), int(mp.solutions.pose.PoseLandmark.RIGHT_ANKLE))
-            delta = points[la, :2] - points[ra, :2]
-            row['ankles_distance_cm'] = float(np.linalg.norm(delta) / data.px_per_cm)
-            row['ankles_horizontal_cm'] = float(abs(delta[0]) / data.px_per_cm)
+    try:
+        if opts.side == 'Automatico':
+            opts = replace(opts, side='Esquerdo' if data.predominant_side == 'left' else 'Direito')
+        phases = gait_phases(data, opts.visibility_threshold) if opts.view == 'Lateral' else None
+        ear_layer = np.zeros((data.height, data.width, 3), np.uint8)
+        ear_mask = np.zeros((data.height, data.width), np.uint8)
+        rows = []
+        total = len(data.landmarks)
+        visual = VisualContinuity(opts)
+        display_frames = visual.build(data.landmarks, data.fps)
+        data.display_records = visual.records
+        registry = FootfallRegistry(data, opts.visibility_threshold)
+        trail = []
+        first_ear = None
+        previous_ear = None
+        ear_path_px = 0.0
+        running = {}
+        stepdown_running = {}
+        for i, points in enumerate(data.landmarks):
+            ok, frame = cap.read()
+            if not ok:
+                raise ValueError(f'Exportacao incompleta: quadro {i} nao pode ser lido.')
+            current_ear = ear_center(points) if opts.view == 'Lateral' else None
             if current_ear is not None:
-                row['ear_displacement_cm'] = float(np.linalg.norm(current_ear - first_ear) / data.px_per_cm)
-                row['ear_path_cm'] = ear_path_px / data.px_per_cm
-        if phases and points is not None:
-            pose = mp.solutions.pose.PoseLandmark
-            phase_rows = []
-            for n, side in enumerate(('left', 'right')):
-                stance = bool(phases[side]['stance'][i])
-                event = phases[side]['event'][i]
-                row[f'{side}_phase'] = 'APOIO' if stance else 'BALANCO'
-                row[f'{side}_event'] = event
-                foot_color = (40, 220, 80) if stance else (30, 170, 255)
-                heel = int(getattr(pose, f'{side.upper()}_HEEL'))
-                toe = int(getattr(pose, f'{side.upper()}_FOOT_INDEX'))
-                ankle = int(getattr(pose, f'{side.upper()}_ANKLE'))
-                cv2.line(frame, tuple(points[heel, :2].astype(int)), tuple(points[toe, :2].astype(int)), foot_color, 7, cv2.LINE_AA)
-                side_letter = ('L' if side == 'left' else 'R') if opts.language == 'en' else 'E' if side == 'left' else 'D'
-                phase_name = tr(opts.language, 'support' if stance else 'swing')
-                phase_rows.append((side_letter, phase_name, foot_color))
-                if event:
-                    phase_rows[-1] = (side_letter, f"{phase_name} - {tr(opts.language, 'contact' if event == 'CONTATO INICIAL' else 'toeoff')}", (40, 255, 255))
-                if event == 'CONTATO INICIAL' and data.px_per_cm and (i - last_contact_frame[side] >= max(6, int(data.fps * 0.35))):
-                    other = int(getattr(pose, f"{('RIGHT' if side == 'left' else 'LEFT')}_ANKLE"))
-                    candidate_step = float(abs(points[ankle, 0] - points[other, 0]) / data.px_per_cm)
-                    heel_x = float(points[heel, 0])
-                    spatial_ok = last_footfall_x is None or abs(heel_x - last_footfall_x) / data.px_per_cm >= 5.0
-                    sequence_ok = last_accepted_side is None or side != last_accepted_side
-                    time_ok = i - last_accepted_frame >= max(6, int(data.fps * 0.25))
-                    if candidate_step >= 5.0 and spatial_ok and sequence_ok and time_ok:
-                        last_contact_frame[side] = i
-                        last_accepted_frame = i
-                        last_accepted_side = side
-                        last_footfall_x = heel_x
-                        latest_step = candidate_step
-                        step_history.append((len(step_history) + 1, side_letter, latest_step))
-                        row['step_number'] = len(step_history)
-                        row['step_side'] = side_letter
-                        footfall_positions.append((len(step_history), side_letter, points[heel, :2].copy()))
-                        candidate_stride = None if last_strike[side] is None else abs(heel_x - last_strike[side]) / data.px_per_cm
-                        last_strike[side] = heel_x
-                        if candidate_stride is not None and candidate_stride >= 5.0:
-                            latest_stride[side] = candidate_stride
-                            stride_history.append((len(stride_history) + 1, side_letter, candidate_stride))
-                            row['stride_number'] = len(stride_history)
-                            row['stride_side'] = side_letter
-                        cv2.line(frame, tuple(points[ankle, :2].astype(int)), tuple(points[other, :2].astype(int)), (255, 60, 220), 4)
-            if latest_step is not None:
-                row['step_length_cm'] = latest_step
-            strides = [v for v in latest_stride.values() if v is not None]
-            if strides:
-                row['stride_length_cm'] = strides[-1]
-            for number, side_letter, position in footfall_positions:
-                p = tuple(position.astype(int))
-                color = (30, 230, 255) if side_letter == 'E' else (255, 170, 30)
-                cv2.circle(frame, p, 13, color, 3, cv2.LINE_AA)
-                cv2.putText(frame, str(number), (p[0] - 5, p[1] - 18), cv2.FONT_HERSHEY_SIMPLEX, 0.65, color, 2, cv2.LINE_AA)
-            draw_right_panel(frame, phase_rows, step_history, stride_history, opts.language)
-        draw_manual_segments(frame, data, opts.language, points)
-        rows.append(row)
-        writer.write(frame)
-        if progress and i % 5 == 0:
-            progress(i * 100 / total, f"{tr(opts.language, 'export_frame')} {i + 1} {tr(opts.language, 'of')} {total}...")
-    cap.release()
-    writer.release()
+                trail.append(current_ear.copy())
+                first_ear = current_ear.copy() if first_ear is None else first_ear
+                if previous_ear is not None:
+                    ear_path_px += float(np.linalg.norm(current_ear - previous_ear))
+                    a, b = (tuple(previous_ear.astype(int)), tuple(current_ear.astype(int)))
+                    cv2.line(ear_layer, a, b, (30, 80, 255), 4, cv2.LINE_AA)
+                    cv2.line(ear_mask, a, b, 255, 5, cv2.LINE_AA)
+                previous_ear = current_ear.copy()
+            frame, metrics = draw_overlay(frame, points, opts, data.calibration_points, ear_trail=None, display=display_frames[i], draw_labels=False)
+            if previous_ear is not None:
+                cv2.copyTo(ear_layer, ear_mask, frame)
+            if current_ear is not None:
+                center = tuple(current_ear.astype(int))
+                cv2.circle(frame, center, 9, (30, 80, 255), -1)
+                cv2.circle(frame, center, 12, (255, 255, 255), 2)
+            cv2.rectangle(frame, (0, 0), (data.width, 52), (20, 20, 20), -1)
+            view_label = tr(opts.language, 'lateral' if opts.view == 'Lateral' else 'frontal')
+            cv2.putText(frame, f"{tr(opts.language, 'analysis')} | {view_label} | t={i / data.fps:.2f}s", (14, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (245, 245, 245), 3)
+            sd_metrics = stepdown_metrics(points, data.px_per_cm, opts.visibility_threshold) if opts.view == 'Frontal' else {}
+            for key, value in metrics.items():
+                if key.endswith('_deg') and np.isfinite(value):
+                    running[key] = (min(running.get(key, (value, value))[0], value), max(running.get(key, (value, value))[1], value))
+            draw_angle_table(frame, display_frames[i].metrics, running, opts.language, display_frames[i].status)
+            for key, value in sd_metrics.items():
+                if np.isfinite(value):
+                    stepdown_running[key] = (min(stepdown_running.get(key, (value, value))[0], value), max(stepdown_running.get(key, (value, value))[1], value))
+            if sd_metrics:
+                draw_stepdown_panel(frame, sd_metrics, stepdown_running, data.px_per_cm is not None, opts.language)
+            row = {'frame': i, 'time_s': i / data.fps, **metrics, **sd_metrics}
+            if points is not None and data.px_per_cm:
+                la, ra = (int(mp.solutions.pose.PoseLandmark.LEFT_ANKLE), int(mp.solutions.pose.PoseLandmark.RIGHT_ANKLE))
+                delta = points[la, :2] - points[ra, :2]
+                validator = LandmarkValidator(opts.visibility_threshold)
+                if validator.valid(points, (la, ra)):
+                    row['ankles_distance_cm'] = validator.distance(points, (la, ra), data.px_per_cm)
+                    row['ankles_horizontal_cm'] = validator.distance(points, (la, ra), data.px_per_cm, horizontal=True)
+                if current_ear is not None:
+                    row['ear_displacement_cm'] = float(np.linalg.norm(current_ear - first_ear) / data.px_per_cm)
+                    row['ear_path_cm'] = ear_path_px / data.px_per_cm
+            if phases:
+                registration=registry.update(i,points,phases)
+                letter=lambda side: ('L' if side=='left' else 'R') if opts.language=='en' else ('E' if side=='left' else 'D')
+                for key in ('step_side','stride_side'):
+                    if key in registration:
+                        registration[key]=letter(registration[key])
+                row.update(registration)
+                phase_rows=[]
+                for side,heel,toe in [('left',29,31),('right',30,32)]:
+                    valid=bool(phases[side]['valid'][i])
+                    stance=bool(phases[side]['stance'][i])
+                    event=phases[side]['event'][i]
+                    if valid:
+                        row[f'{side}_phase']='APOIO' if stance else 'BALANCO'
+                        row[f'{side}_event']=event
+                    confirmed=stance and registry.support_confirmed[side]
+                    color=(40,220,80) if confirmed else (30,220,255) if stance else (30,170,255)
+                    if not valid:
+                        label=tr(opts.language,'signal_lost')
+                        color=(160,160,160)
+                    elif stance and not confirmed:
+                        label=tr(opts.language,'unconfirmed_support')
+                    else:
+                        label=tr(opts.language,'support' if stance else 'swing')
+                    phase_rows.append((letter(side),label,color))
+                    if LandmarkValidator(opts.visibility_threshold).valid(points,(heel,toe)):
+                        cv2.line(frame,tuple(points[heel,:2].astype(int)),tuple(points[toe,:2].astype(int)),color,7,cv2.LINE_AA)
+                steps=[(entry['number'],letter(entry['side']),entry['step_cm']) for entry in registry.footfalls]
+                strides=[(entry['number'],letter(entry['side']),entry['length_cm']) for entry in registry.strides]
+                for entry in registry.footfalls:
+                    if entry['position'] is None:
+                        continue
+                    position=tuple(entry['position'].astype(int))
+                    color=(30,230,255) if entry['side']=='left' else (255,170,30)
+                    cv2.circle(frame,position,13,color,3,cv2.LINE_AA)
+                    cv2.putText(frame,str(entry['number']),(position[0]-5,position[1]-18),cv2.FONT_HERSHEY_SIMPLEX,.65,color,2,cv2.LINE_AA)
+                draw_right_panel(frame,phase_rows,steps,strides,opts.language)
+            draw_manual_segments(frame, data, opts.language, points, opts.visibility_threshold)
+            draw_joint_labels(frame, display_frames[i].points, display_frames[i].metrics, opts, display_frames[i].status)
+            rows.append(row)
+            writer.write(frame)
+            if progress and i % 5 == 0:
+                progress(i * 100 / total, f"{tr(opts.language, 'export_frame')} {i + 1} {tr(opts.language, 'of')} {total}...")
+    finally:
+        cap.release()
+        writer.release()
     csv_path = out_path.with_suffix('.csv')
     fields = ['frame', 'time_s', 'left_hip_deg', 'left_knee_deg', 'left_ankle_deg', 'right_hip_deg', 'right_knee_deg', 'right_ankle_deg', 'left_q_estimated_deg', 'right_q_estimated_deg', 'pelvic_tilt_deg', 'trunk_lean_deg', 'left_fppa_deg', 'right_fppa_deg', 'left_knee_foot_offset_cm', 'right_knee_foot_offset_cm', 'left_phase', 'right_phase', 'left_event', 'right_event', 'step_number', 'step_side', 'step_length_cm', 'stride_number', 'stride_side', 'stride_length_cm', 'ankles_distance_cm', 'ankles_horizontal_cm', 'ear_displacement_cm', 'ear_path_cm']
-    with csv_path.open('w', newline='', encoding='utf-8') as f:
-        w = csv.DictWriter(f, fieldnames=fields, extrasaction='ignore')
-        w.writeheader()
-        w.writerows(rows)
+    CsvExporter().export(csv_path, fields, rows)
+    data.full_precision_rows = rows
+    data.gait_records = registry.decisions + [dict(kind='footfall', **entry) for entry in registry.footfalls] if phases else []
+    data.record('export_prepared', output=str(published_output or out_path), frames=len(rows))
+    session_path = data.session_path or out_path.with_name(f'{out_path.stem}_{data.session_id[:8]}.session.zip')
+    SessionStore().save(data, session_path, opts)
     return csv_path
 
 class VideoExporter:
@@ -555,7 +584,30 @@ class VideoExporter:
         self.progress = progress
 
     def export(self, analysis, output_path):
-        return _render_video(analysis, output_path, self.options, self.progress)
+        output_path = Path(output_path)
+        if output_path.resolve() == analysis.input_path.resolve():
+            raise ValueError('A saida nao pode sobrescrever o video original.')
+        analysis.capture_originals()
+        identity = SessionStore.source_identity(analysis.input_path)
+        if analysis.source_identity and identity != analysis.source_identity:
+            raise ValueError('O video foi alterado desde a deteccao.')
+        analysis.source_identity = identity
+        if analysis.session_path is None:
+            analysis.session_path = output_path.with_name(f'{output_path.stem}_{analysis.session_id[:8]}.session.zip')
+        staged = output_path.with_name(f'.{output_path.stem}.{uuid4().hex}.tmp.mp4')
+        staged_csv = staged.with_suffix('.csv')
+        try:
+            _render_video(analysis, staged, self.options, self.progress, published_output=output_path)
+            if not staged.is_file() or staged.stat().st_size == 0:
+                raise ValueError('Video de saida vazio.')
+            ArtifactPublisher().publish([(staged, output_path), (staged_csv, output_path.with_suffix('.csv'))])
+            analysis.record('export', output=str(output_path), frames=len(analysis.full_precision_rows))
+            SessionStore().save(analysis, options=self.options)
+        finally:
+            for temporary in (staged, staged_csv):
+                if temporary.exists():
+                    temporary.unlink()
+        return output_path.with_suffix('.csv')
 
 def render_video(data, out_path, opts, progress=None):
     """Fachada publica preservada para nao alterar o codigo da interface."""

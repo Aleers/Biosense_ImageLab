@@ -7,6 +7,7 @@ from tkinter import filedialog, messagebox, ttk
 from i18n import LANGUAGES, canonical_side, canonical_view, side_values, tr, view_values
 from processor import ProcessingOptions, analyze_video, render_video
 from reviewer import ReviewWindow
+from session import SessionStore
 
 class MarchaApp(tk.Tk):
     """Janela principal e coordenadora do fluxo analisar, revisar e exportar.
@@ -71,6 +72,9 @@ class MarchaApp(tk.Tk):
         parent.columnconfigure(1, weight=1)
 
     def _change_language(self, _event=None):
+        if self.worker and self.worker.is_alive() or str(self.start_button['state']) == 'disabled':
+            self.language_display.set(LANGUAGES[self.language_code])
+            return
         old = self.language_code
         canonical_v = canonical_view(old, self.view.get())
         canonical_s = canonical_side(old, self.side.get())
@@ -82,7 +86,7 @@ class MarchaApp(tk.Tk):
         self._build()
 
     def _choose_input(self) -> None:
-        path = filedialog.askopenfilename(filetypes=[('Videos', '*.mp4 *.avi *.mov *.mkv'), ('Todos', '*.*')])
+        path = filedialog.askopenfilename(filetypes=[('Videos', '*.mp4 *.avi *.mov *.mkv'), ('Sessoes', '*.session.zip'), ('Todos', '*.*')])
         if path:
             self.input_path.set(path)
             p = Path(path)
@@ -120,12 +124,23 @@ class MarchaApp(tk.Tk):
 
     def _run_analysis(self, src: Path, opts: ProcessingOptions) -> None:
         try:
-            data = analyze_video(src, lambda p, s: self.events.put(('progress', p, s)), opts.language)
+            if src.name.endswith('.session.zip'):
+                data = SessionStore().load(src)
+                opts = ProcessingOptions(**data.saved_options) if data.saved_options else opts
+            else:
+                data = analyze_video(src, lambda p, s: self.events.put(('progress', p, s)), opts.language, opts.smoothing_seconds)
+                session_path = self.current_output.with_name(f'{self.current_output.stem}_{data.session_id[:8]}.session.zip')
+                SessionStore().save(data, session_path, opts)
             self.events.put(('review', data, opts))
         except Exception as exc:
             self.events.put(('error', str(exc)))
 
     def _export(self, review_window) -> None:
+        if review_window.tracking:
+            return
+        if not review_window.persist():
+            return
+        review_window.closed.set()
         review_window.playing = False
         review_window.cap.release()
         review_window.destroy()
@@ -148,6 +163,7 @@ class MarchaApp(tk.Tk):
                     self.progress['value'] = event[1]
                     self.status.set(event[2])
                 elif event[0] == 'review':
+                    self.current_options = event[2]
                     self.progress['value'] = 100
                     self.status.set(tr(self.language_code, 'detected'))
                     ReviewWindow(self, event[1], event[2], self._export)

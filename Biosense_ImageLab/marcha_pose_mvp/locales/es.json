@@ -68,5 +68,8 @@
   "trunk": "Incl. tronco",
   "undo": "Deshacer",
   "view": "Vista de camara",
-  "warning": "Aviso: prototipo de analisis cinematico 2D. No es un dispositivo medico ni sustituye la evaluacion de un fisioterapeuta. La camara debe permanecer fija y perpendicular al plano del movimiento."
+  "warning": "Aviso: prototipo de analisis cinematico 2D. No es un dispositivo medico ni sustituye la evaluacion de un fisioterapeuta. La camara debe permanecer fija y perpendicular al plano del movimiento.",
+  "signal_lost": "SIN SENAL",
+  "unconfirmed_support": "APOYO SIN NUEVO CONTACTO",
+  "display_quality_legend": "~ RETENIDO PARA VISUALIZACION | -- MEDIDA NO DISPONIBLE"
 }
