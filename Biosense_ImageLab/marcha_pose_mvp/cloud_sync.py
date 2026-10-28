@@ -8,10 +8,7 @@ from urllib.parse import quote
 import requests
 
 
-API_URL = (
-    "https://biosense-api."
-    "andreximenescapel.workers.dev"
-)
+API_URL = "https://biosense-api.biosense-imagelab.workers.dev"
 
 LIMITE_VIDEO = 80 * 1024 * 1024
 LIMITE_CSV = 2 * 1024 * 1024
