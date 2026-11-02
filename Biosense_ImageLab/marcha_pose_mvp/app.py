@@ -8,6 +8,7 @@ from i18n import LANGUAGES, canonical_side, canonical_view, side_values, tr, vie
 from processor import ProcessingOptions, analyze_video, render_video
 from reviewer import ReviewWindow
 from session import SessionStore
+from cloud_sync import sincronizar_analise, CloudSyncError
 
 class MarchaApp(tk.Tk):
     """Janela principal e coordenadora do fluxo analisar, revisar e exportar.
@@ -148,12 +149,54 @@ class MarchaApp(tk.Tk):
         self.worker = threading.Thread(target=self._run_export, args=(review_window.data,), daemon=True)
         self.worker.start()
 
+
     def _run_export(self, data) -> None:
         try:
-            csv_path = render_video(data, self.current_output, self.current_options, lambda p, s: self.events.put(('progress', p, s)))
-            self.events.put(('done', self.current_output, csv_path))
+            csv_path = render_video(
+                data,
+                self.current_output,
+                self.current_options,
+                lambda p, s: self.events.put(('progress', p, s))
+            )
         except Exception as exc:
             self.events.put(('error', str(exc)))
+            return
+
+        try:
+            self.events.put((
+                'progress',
+                100,
+                'Enviando arquivos para a nuvem...'
+            ))
+
+            resultado = sincronizar_analise(
+                self.current_output,
+                csv_path
+            )
+
+            mensagem = (
+                "Nuvem: sincronizacao concluida\n"
+                f"ID: {resultado['id']}"
+            )
+
+        except CloudSyncError as exc:
+            mensagem = (
+                "Nuvem: envio nao concluido\n"
+                f"Motivo: {exc}"
+            )
+
+        except Exception:
+            mensagem = (
+                "Nuvem: falha inesperada.\n"
+                "Os arquivos locais foram preservados."
+            )
+
+        self.events.put((
+            'done',
+            self.current_output,
+            csv_path,
+            mensagem
+        ))
 
     def _poll_events(self) -> None:
         try:
@@ -167,11 +210,19 @@ class MarchaApp(tk.Tk):
                     self.progress['value'] = 100
                     self.status.set(tr(self.language_code, 'detected'))
                     ReviewWindow(self, event[1], event[2], self._export)
+
                 elif event[0] == 'done':
                     self.start_button.config(state='normal')
                     self.progress['value'] = 100
                     self.status.set(tr(self.language_code, 'done'))
-                    messagebox.showinfo(tr(self.language_code, 'complete'), f'Video: {event[1]}\nCSV: {event[2]}')
+
+                    messagebox.showinfo(
+                        tr(self.language_code, 'complete'),
+                        f'Vídeo: {event[1]}\n'
+                        f'CSV: {event[2]}\n\n'
+                        f'{event[3]}'
+                    )
+
                 elif event[0] == 'error':
                     self.start_button.config(state='normal')
                     self.status.set(tr(self.language_code, 'failed'))
