@@ -9,6 +9,8 @@ from processor import ProcessingOptions, analyze_video, render_video
 from reviewer import ReviewWindow
 from session import SessionStore
 from cloud_sync import sincronizar_analise, CloudSyncError
+from history_window import HistoryWindow
+
 
 class MarchaApp(tk.Tk):
     """Janela principal e coordenadora do fluxo analisar, revisar e exportar.
@@ -63,8 +65,19 @@ class MarchaApp(tk.Tk):
         ttk.Label(root, textvariable=self.status, wraplength=700).pack(anchor='w')
         self.start_button = ttk.Button(root, text=tr(lang, 'process'), command=self._start)
         self.start_button.pack(anchor='e', pady=18)
+        self.history_button = ttk.Button(
+            root,
+            text="Histórico de Análises",
+            command=self._open_history
+        )
+        self.history_button.pack(anchor="e", pady=(0, 10))
+
         ttk.Separator(root).pack(fill='x')
         ttk.Label(root, text=tr(lang, 'warning'), foreground='#8a4b08', wraplength=700).pack(anchor='w', pady=12)
+
+    def _open_history(self) -> None:
+        HistoryWindow(self)
+
 
     def _file_row(self, parent, label, variable, command, row) -> None:
         ttk.Label(parent, text=label, width=16).grid(row=row, column=0, sticky='w', pady=5)
